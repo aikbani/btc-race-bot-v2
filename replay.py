@@ -1,418 +1,623 @@
-"""Local bars-replay/v1 harness driver.
+"""Local replay driver for the cbBTC race bot.
 
-Faithful re-implementation of the make.fun harness side of
-agent-fun/bars-replay/v1, from contracts/bars-protocol.ts (kit harness-src)
-and the competition's own config (capital 1,000 USDC, fee 4 bps, slippage
-2 bps, min notional $1, max 1 open position, max weight 100%, latency 1 bar).
+Runs main.py as a subprocess and feeds it the bars of a window exactly the
+way the official harness does: one hello, one batch per minute, orders decided
+on a batch filling at the next bar's open. Fills follow the protocol's own
+model, in integer arithmetic throughout:
 
-Two ways to run a bot:
-  * in-process: run_inprocess(bot_on_batch, bars) — drives the bot's real
-    on_batch through the real vendor shim (BarsState), no subprocess.
-  * subprocess: run_subprocess(bot_path, bars) — speaks NDJSON to the bot
-    exactly like the server harness does (hello, batch..., done).
+- a buy spends its notional less a 4 bps fee, fills 2 bps above the open, and
+  pays constant-product impact against the bar's open depth;
+- a sell gets 2 bps under the open (after impact), less a 4 bps fee;
+- anything still held at the end is flattened at the last close against that
+  close's depth, with the same fee and slippage and no slippage cap.
 
-Bars are dicts in kit shape: {"t": ms, "o","h","l","c": str ints at
-price_scale 5, "o_depth": [str ints], "c_depth": [str ints]}.
+The driver also enforces the harness's decision checks (cash, weight, minimum
+notional, last-batch rejection) in the same order, tracks cash and the one
+position, and reports net PnL, trade count and maximum drawdown.
 
-Fill math (all integer, truncating division; every value positive):
-  buy : spend = notional * 9996 // 10000
-        price = open * 10002 * y * (y + spend) // (10000 * D * D)
-        qty   = spend * 10**7 // price
-  sell: a     = qty * open // 10**7            (value of qty at the open)
-        price = max(1, open * 9998 * y * y // (10000 * (D*D + a*y)))
-        gross = qty * price // 10**7
-        proceeds = gross * 9996 // 10000
-  D = 1 / sum(1/Di) over the bar's o_depth hops; y starts at D and walks
-  with each fill at that open. Max-slippage is checked against the latest
-  close the bot decided on (buy: price*10000 > close*10200 rejects).
-  At the end every position is flattened at the last close against that
-  close's c_depth, with no slippage cap and no min-notional check.
+Two entry points for the other scripts in this repo: run_dev() grades the bot
+on the frozen dev window from the kit, and run_window() on a raw-numbers
+window from the local extras folder (race is the 15 Nov window). A raw file
+carries no pool depths, so every one of its bars trades against the same
+open and close depth: one constant, RAW_DEPTH below. Its bars are
+deduplicated by timestamp and sliced to exactly 24 hours from the window
+start, with each bar timestamped at its open time plus 60 seconds, in
+milliseconds.
+
+A raw row is [timestamp, LOW, HIGH, OPEN, CLOSE, volume] -- the first price
+column is the bar's low (it is the minimum of the four prices in every row
+of every file) and the third is the open (it chains to the previous row's
+close), not [timestamp, open, high, low, close] as the column order first
+suggests. The bot's decisions only read closes, so the old mapping got the
+decisions right and only the fill prices wrong.
 """
 
 import gzip
 import json
+import os
+import re
+import shutil
 import subprocess
 import sys
+import tempfile
+from decimal import Decimal
+from pathlib import Path
 
-QUOTE_SCALE = 6
-PRICE_SCALE = 5
-QTY_SCALE = 8
-FEE_BPS = 4
-SLIP_BPS = 2
-MIN_NOTIONAL = 1_000_000
-START_CASH = 1_000_000_000
+WORKDIR = Path(__file__).resolve().parent
+KIT = WORKDIR.parent / "btc-race-24h-v2-kit" / "btc-race-24h-20261117-0603-kit"
+EXTRAS = WORKDIR.parent / "btc-race-24h-v2-local-extras"
+
 SYMBOL = "CBBTC"
 MINT = "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij"
-DEV_DEPTH_MEDIAN = 642377006705  # median o_depth of the kit dev bars (quote units)
+PRICE_SCALE = 5
+QTY_SCALE = 8
+QUOTE_SCALE = 6
+START_CASH = 1_000_000_000  # 1,000 USDC, in micro-USDC
+FEE_BPS = 4
+SLIP_BPS = 2
+MIN_NOTIONAL = 1_000_000  # 1 USDC
+MAX_ORDERS = 16
+MAX_WEIGHT_BPS = 10000
+BPS = 10000
+STEP_MS = 60000
 
-# Paths for this race (btc-race-24h-20261117-0603). The dev bars come
-# straight from the new competition kit; the race window is the local
-# sanity copy kept under data/ (dev tool only — never part of the entry).
-WORKDIR = "/home/hatch/workspace/makefun/work/btc-race-24h-v2"
-NEW_KIT_DEV_BARS = ("/home/hatch/workspace/makefun/work/btc-race-24h-v2-kit/"
-                    "btc-race-24h-20261117-0603-kit/dataset/bars/CBBTC.ndjson.gz")
-RACE_WINDOW_JSON = WORKDIR + "/data/btc-race-window.json"
-RACE_WINDOW_START = 1794753780  # 2026-11-15 08:28 UTC
+
+def _gcd(a, b):
+    while b:
+        a, b = b, a % b
+    return a
 
 
 def value(qty, price):
+    """What qty is worth at price, truncated, in micro-USDC."""
     return qty * price * 10 ** QUOTE_SCALE // 10 ** (QTY_SCALE + PRICE_SCALE)
 
 
-def load_dev_bars():
-    """The new kit's dev bars: 16 Nov 13:04 -> 17 Nov 13:03 WIB, 1440 bars."""
+class _Pool:
+    """One bar's constant-product pool, walked by the fills at its open.
+
+    Mirrors the harness's pool: depths are hops in series, the state is the
+    quote side y against the invariant x*y = D^2, kept as reduced fractions
+    so every fill price comes out exactly.
+    """
+
+    __slots__ = ("yn", "yd", "kn", "kd", "unit")
+
+    def __init__(self, yn, yd, kn, kd, unit=10 ** 6):
+        g = _gcd(yn, yd)
+        self.yn = yn // g
+        self.yd = yd // g
+        self.kn = kn
+        self.kd = kd
+        self.unit = unit
+
+    @classmethod
+    def fresh(cls, depths):
+        d = [x * 10 ** QUOTE_SCALE for x in depths]
+        prod = 1
+        for x in d:
+            prod *= x
+        total = 0
+        for i in range(len(d)):
+            other = 1
+            for j, x in enumerate(d):
+                if j != i:
+                    other *= x
+            total += other
+        g = _gcd(prod, total)
+        yn, yd = prod // g, total // g
+        return cls(yn, yd, yn * yn, yd * yd)
+
+    def buy(self, spend):
+        yn2 = self.yn + spend * self.unit * self.yd
+        num = self.yn * yn2 * self.kd
+        den = self.yd * self.yd * self.kn
+        return num, den, _Pool(yn2, self.yd, self.kn, self.kd)
+
+    def sell(self, worth):
+        t = self.kn * self.yd + worth * self.unit * self.yn * self.kd
+        num = t * self.yd
+        den = self.kd * self.yn * self.yn
+        return num, den, _Pool(self.kn * self.yn, t, self.kn, self.kd)
+
+
+def _pool_for(depths):
+    return None if depths is None else _Pool.fresh(depths)
+
+
+def _buy_fill(notional, open_price, pool):
+    spend = notional * (BPS - FEE_BPS) // BPS
+    fee = notional - spend
+    if pool is None:
+        price = open_price * (BPS + SLIP_BPS) // BPS
+        after = None
+    else:
+        num, den, after = pool.buy(spend)
+        price = open_price * (BPS + SLIP_BPS) * num // (BPS * den)
+    qty = spend * 10 ** (QTY_SCALE + PRICE_SCALE) // (price * 10 ** QUOTE_SCALE)
+    return price, spend, fee, qty, after
+
+
+def _sell_fill(qty, open_price, pool):
+    worth = value(qty, open_price)
+    if pool is None:
+        slipped = open_price * (BPS - SLIP_BPS) // BPS
+        after = None
+    else:
+        num, den, after = pool.sell(worth)
+        slipped = open_price * (BPS - SLIP_BPS) * den // (BPS * num)
+    price = slipped if slipped > 1 else 1
+    gross = value(qty, price)
+    proceeds = gross * (BPS - FEE_BPS) // BPS
+    return price, gross, gross - proceeds, proceeds, after
+
+
+def dev_bars():
+    """The frozen dev window's bars, from the kit dataset."""
+    path = KIT / "dataset" / "bars" / "CBBTC.ndjson.gz"
     bars = []
-    with gzip.open(NEW_KIT_DEV_BARS, "rt") as f:
-        for line in f:
-            b = json.loads(line)
-            bars.append({
-                "t": int(b["t"]),
-                "o": int(b["o"]), "h": int(b["h"]), "l": int(b["l"]), "c": int(b["c"]),
-                "o_depth": [int(d) for d in b["o_depth"]],
-                "c_depth": [int(d) for d in b["c_depth"]],
-            })
+    with gzip.open(path, "rt") as fh:
+        for line in fh:
+            raw = json.loads(line)
+            bars.append(
+                {
+                    "t": int(raw["t"]),
+                    "o": int(raw["o"]),
+                    "h": int(raw["h"]),
+                    "l": int(raw["l"]),
+                    "c": int(raw["c"]),
+                    "o_depth": [int(x) for x in raw["o_depth"]],
+                    "c_depth": [int(x) for x in raw["c_depth"]],
+                }
+            )
     return bars
 
 
-def load_coinbase(path, start_ts, depth=DEV_DEPTH_MEDIAN):
-    """Coinbase BTC-USD 1m candles -> kit-shaped bars, exactly 1440 bars
-    from start_ts (seconds). Candle: [time, low, high, open, close, vol]."""
-    raw = json.load(open(path))
-    seen = {}
-    for c in raw:
-        seen[int(c[0])] = c  # dedupe chunk-boundary overlaps
-    out = []
-    for t_open in sorted(seen):
-        c = seen[t_open]
-        if t_open < start_ts or t_open >= start_ts + 86400:
-            continue
-        o = int(round(float(c[3]) * 10 ** PRICE_SCALE))
-        h = int(round(float(c[2]) * 10 ** PRICE_SCALE))
-        l = int(round(float(c[1]) * 10 ** PRICE_SCALE))
-        cl = int(round(float(c[4]) * 10 ** PRICE_SCALE))
-        out.append({"t": (t_open + 60) * 1000, "o": o, "h": h, "l": l, "c": cl,
-                    "o_depth": [depth], "c_depth": [depth]})
-    out.sort(key=lambda b: b["t"])
-    assert len(out) >= 1400, f"{path}: {len(out)} bars, expected ~1440"
-    return out
+# The one constant open/close depth every raw-window bar trades against.
+#
+# The median open depth of the kit dev bars was measured first
+# (880211041956, the mean of the two middle values 879955678897 and
+# 880466405015) and does NOT reproduce the verified numbers: at that depth
+# nextdev nets +$4.70 (not +$3.85), w4 -$22.05 (not -$22.11) and w6 -$1.49
+# (not -$2.32). No statistic of any depth series in the kit can be the
+# fitting depth either -- the smallest depth value anywhere in the kit
+# (dev o_depth, samples liquidity and vaults[1]) is 708848708439, above
+# the fitting range. So the constant is fitted, not derived: 642500000000
+# is the midpoint of 642.2e9-642.7e9, the only depth interval on which
+# nextdev, w4 and w6 all match their verified numbers exactly (net to the
+# cent, trade count, drawdown to 0.01pp). At this depth dev is also exact.
+# Race and w5 still do not match their quoted targets (see verify_final.py):
+# in every 1440-bar construction the bot's exit never fires in-window, so
+# both windows end on the single late buy with the flatten -- a structural
+# property of the bot and the bars, not of the depth.
+RAW_DEPTH = 642_500_000_000
 
 
-def make_hello(first_close_ms):
+def _row_bar(row, depth):
+    to_int = lambda x: int((Decimal(str(x)) * 100000).to_integral_value())
     return {
-        "type": "hello",
-        "protocol": "agent-fun/bars-replay/v1",
-        "seed": "1",
-        "symbols": [{"symbol": SYMBOL, "mint": MINT,
-                     "price_scale": PRICE_SCALE, "qty_scale": QTY_SCALE}],
-        "capital": {"quote": "USDC", "quote_scale": QUOTE_SCALE,
-                    "quote_units": str(START_CASH)},
-        "bar_interval": "1m",
-        "first_close_ms": first_close_ms,
-        "caps": {"max_open_positions": 1, "max_orders_per_bar": 16,
-                 "max_weight_bps": 10000, "shorts": False, "leverage": False},
-        "fees": {"fee_bps": FEE_BPS, "slippage_bps": SLIP_BPS,
-                 "min_notional_quote_units": str(MIN_NOTIONAL)},
-        "latency_bars": 1,
+        # row[0] is the bar's open time in seconds; the harness timestamps
+        # a bar at its close, i.e. open + 60 seconds, in milliseconds.
+        # Columns are [ts, low, high, open, close, volume] (see the module
+        # docstring): row[1] is the low, row[2] the high, row[3] the open.
+        "t": int(row[0]) * 1000 + STEP_MS,
+        "o": to_int(row[3]),
+        "h": to_int(row[2]),
+        "l": to_int(row[1]),
+        "c": to_int(row[4]),
+        "o_depth": [depth],
+        "c_depth": [depth],
     }
 
 
-class Harness:
-    """The harness side: holds the account, resolves orders at each bar's
-    open, tracks equity / drawdown / trades / fees."""
+def race_slots(filename="btc-race-window.json"):
+    """A raw JSON window as minute slots: dedup, exactly 24h from the start.
 
-    def __init__(self, bars):
-        self.bars = bars
-        self.cash = START_CASH
-        self.qty = 0
-        self.cost = 0
-        self.trades = 0          # bot's own filled orders
-        self.fees = 0
-        self.peak_equity = START_CASH
-        self.max_dd = 0.0
-        self.equity_curve = []
-        self.fills_log = []      # (seq, side, price, qty, notional, status)
-        self._pending = []       # (orders, decision_close)
-        self._flattened = False
-
-    def account(self, equity):
-        pos = []
-        if self.qty > 0:
-            pos.append({"symbol": SYMBOL, "qty": str(self.qty),
-                        "cost_quote_units": str(self.cost)})
-        return {"cash_quote_units": str(self.cash), "positions": pos,
-                "equity_quote_units": str(equity)}
-
-    def equity_at(self, close):
-        return self.cash + value(self.qty, close)
-
-    def _note_equity(self, close):
-        eq = self.equity_at(close)
-        if eq > self.peak_equity:
-            self.peak_equity = eq
-        dd = (self.peak_equity - eq) / self.peak_equity if self.peak_equity else 0.0
-        if dd > self.max_dd:
-            self.max_dd = dd
-        self.equity_curve.append(eq)
-        return eq
-
-    @staticmethod
-    def _pool_D(depths):
-        # D = 1 / sum(1/Di), exact fraction as (num, den): D = prod / sum(prod/Di)
-        prod = 1
-        for d in depths:
-            prod *= d
-        total = 0
-        for i, d in enumerate(depths):
-            other = 1
-            for j, dd in enumerate(depths):
-                if j != i:
-                    other *= dd
-            total += other
-        return prod, total  # D = prod / total
-
-    def resolve_orders(self, orders, decision_close, bar):
-        """Resolve one reply's orders at bar's open. Returns fill dicts."""
-        fills = []
-        D_num, D_den = self._pool_D(bar["o_depth"])
-        # y starts at D: keep y as fraction y_num / y_den with y_den = D_den
-        # (y = D * k where k tracks walks). Simpler: track y as a Fraction
-        # via numerator over D_den * D_num powers — but with <=16 orders and
-        # one hop in practice, use exact rational with Python ints.
-        from fractions import Fraction
-        D = Fraction(D_num, D_den)
-        y = D
-        op = int(bar["o"])
-        for o in orders:
-            side = o["side"]
-            cid = o["client_id"]
-            bps = o["max_slippage_bps"]
-            base = {"client_id": cid, "symbol": SYMBOL, "side": side}
-            if side == "buy":
-                notional = int(o["notional_quote_units"])
-                if notional < MIN_NOTIONAL:
-                    fills.append({**base, "status": "rejected",
-                                  "reason": "below_min_notional"})
-                    continue
-                if notional > self.cash:
-                    fills.append({**base, "status": "rejected",
-                                  "reason": "insufficient_cash"})
-                    continue
-                if self.qty > 0:
-                    fills.append({**base, "status": "rejected",
-                                  "reason": "max_open_positions"})
-                    continue
-                eq_dec = self.cash + value(self.qty, decision_close)
-                if value(self.qty, decision_close) + notional > eq_dec:
-                    fills.append({**base, "status": "rejected",
-                                  "reason": "max_weight"})
-                    continue
-                spend = notional * (10000 - FEE_BPS) // 10000
-                # price = open * (10000+slip) * M / 10000, M = y*(y+a)/D^2
-                a = spend  # quote units == USDC raw units (quote_scale 6)
-                M = y * (y + a) / (D * D)
-                price = int(op * (10000 + SLIP_BPS) * M // 10000)
-                if price * 10000 > decision_close * (10000 + bps):
-                    fills.append({**base, "status": "rejected",
-                                  "reason": "max_slippage"})
-                    continue
-                q = spend * 10 ** (QTY_SCALE + PRICE_SCALE) // (price * 10 ** QUOTE_SCALE)
-                if q <= 0:
-                    fills.append({**base, "status": "rejected",
-                                  "reason": "zero_amount"})
-                    continue
-                y = y + a
-                self.cash -= notional
-                self.qty += q
-                self.cost += notional
-                self.fees += notional - spend
-                self.trades += 1
-                fills.append({**base, "status": "filled", "price": str(price),
-                              "qty": str(q), "notional_quote_units": str(notional),
-                              "fee_quote_units": str(notional - spend)})
-            else:  # sell
-                q = int(o["qty"])
-                if q <= 0 or q > self.qty:
-                    fills.append({**base, "status": "rejected",
-                                  "reason": "insufficient_position"})
-                    continue
-                val_close = value(q, decision_close)
-                empties = (q == self.qty)
-                if val_close < MIN_NOTIONAL and not empties:
-                    fills.append({**base, "status": "rejected",
-                                  "reason": "below_min_notional"})
-                    continue
-                a = value(q, op)
-                M = (D * D + a * y) / (y * y)
-                price = int(op * (10000 - SLIP_BPS) // (10000 * M))
-                if price < 1:
-                    price = 1
-                if price * 10000 < decision_close * (10000 - bps):
-                    fills.append({**base, "status": "rejected",
-                                  "reason": "max_slippage"})
-                    continue
-                gross = value(q, price)
-                proceeds = gross * (10000 - FEE_BPS) // 10000
-                y = D * D * y / (D * D + a * y)
-                self.cash += proceeds
-                self.cost = self.cost * (self.qty - q) // self.qty if self.qty else 0
-                self.qty -= q
-                self.fees += gross - proceeds
-                self.trades += 1
-                fills.append({**base, "status": "filled", "price": str(price),
-                              "qty": str(q), "notional_quote_units": str(proceeds),
-                              "fee_quote_units": str(gross - proceeds)})
-        return fills
-
-    def flatten(self):
-        """Sell everything at the last close against its c_depth."""
-        if self.qty <= 0:
-            return None
-        bar = self.bars[-1]
-        # Reuse resolve_orders with a synthetic sell at the last bar's close
-        # depth: temporarily swap o_depth for c_depth.
-        fake = dict(bar)
-        fake["o_depth"] = bar["c_depth"]
-        fills = self.resolve_orders(
-            [{"side": "sell", "client_id": "_flatten_0", "symbol": SYMBOL,
-              "qty": str(self.qty), "max_slippage_bps": 10000}],
-            int(bar["c"]), fake)
-        self._flattened = True
-        return fills[0] if fills else None
-
-    def summary(self):
-        pnl = self.cash - START_CASH
-        return {
-            "net_pnl_usd": pnl / 1e6,
-            "net_pnl_micro": pnl,
-            "trades": self.trades,
-            "max_dd_pct": self.max_dd * 100,
-            "fees_usd": self.fees / 1e6,
-            "final_cash_usd": self.cash / 1e6,
-            "guardrail_trades_ok": self.trades >= 1,
-            "guardrail_dd_ok": self.max_dd <= 0.25,
-        }
+    The raw file is [timestamp, low, high, open, close, volume] rows with
+    timestamps in seconds. The same minute can appear twice where chunks
+    overlap, so later duplicates are dropped; the window is then the
+    first 1440 minute slots from its start (exactly 24 hours), with gaps
+    kept as None. Every bar gets the same open and close depth: RAW_DEPTH
+    (see its comment above -- the kit dev median does not reproduce the
+    verified numbers, so the constant is the fitted midpoint).
+    """
+    rows = json.load(open(EXTRAS / "data" / filename))
+    depth = RAW_DEPTH
+    by_ts = {}
+    for row in rows:
+        by_ts.setdefault(int(row[0]), row)
+    stamps = sorted(by_ts)
+    first = stamps[0] * 1000 + STEP_MS
+    slots = [None] * ((stamps[-1] - stamps[0]) // 60 + 1)
+    for stamp in stamps:
+        slots[(stamp - stamps[0]) // 60] = _row_bar(by_ts[stamp], depth)
+    return slots[:1440], first
 
 
-def run_inprocess(bot_on_batch, bars, shim_dir):
-    """Drive the bot's real on_batch through the real vendor shim."""
-    sys.path.insert(0, shim_dir)
-    import makefun_bars
-    hello = make_hello(bars[0]["t"])
-    h = Harness(bars)
-    state = makefun_bars.BarsState(hello)
-    for seq, bar in enumerate(bars):
-        fills = []
-        if h._pending:
-            orders, decision_close = h._pending
-            fills = h.resolve_orders(orders, decision_close, bar)
-            h._pending = []
-        eq = h.equity_at(int(bar["c"]))
-        if eq > h.peak_equity:
-            h.peak_equity = eq
-        dd = (h.peak_equity - eq) / h.peak_equity
-        h.max_dd = max(h.max_dd, dd)
-        h.equity_curve.append(eq)
-        batch = {"type": "batch", "seq": seq, "t": int(bar["t"]),
-                 "bars": [{"symbol": SYMBOL, "t": int(bar["t"]),
-                           "o": str(bar["o"]), "h": str(bar["h"]),
-                           "l": str(bar["l"]), "c": str(bar["c"]),
-                           "v": None,
-                           "o_depth": [str(d) for d in bar["o_depth"]],
-                           "c_depth": [str(d) for d in bar["c_depth"]]}],
-                 "fills": fills,
-                 "account": h.account(eq)}
-        state.apply_batch(batch)
-        orders = state.to_orders(bot_on_batch(state, batch))
-        state.record_orders(orders)
-        if orders:
-            h._pending = (orders, int(bar["c"]))
-        for f in fills:
-            h.fills_log.append((seq, f))
-    # Orders decided on the last batch are rejected (after_end): drop them.
-    h._pending = []
-    flat = h.flatten()
-    final_eq = h.cash
-    h._note_equity(int(bars[-1]["c"]))
-    return h
+def _wire_bar(bar):
+    # The bot never reads depths (it sizes from cash and the weight room),
+    # so a bar without depths still wires a harmless placeholder there.
+    return {
+        "symbol": SYMBOL,
+        "t": bar["t"],
+        "o": str(bar["o"]),
+        "h": str(bar["h"]),
+        "l": str(bar["l"]),
+        "c": str(bar["c"]),
+        "v": None,
+        "o_depth": [str(x) for x in bar["o_depth"]] if bar["o_depth"] else ["1"],
+        "c_depth": [str(x) for x in bar["c_depth"]] if bar["c_depth"] else ["1"],
+    }
 
 
-def run_subprocess(bot_path, bars):
-    """Speak the protocol to the bot over pipes, exactly like the server."""
-    hello = make_hello(bars[0]["t"])
-    h = Harness(bars)
+def _decide(orders, seq, is_last, cash, qty, close, equity, used_ids):
+    """The harness's decision checks, in its order, for one reply."""
+    pending = []
+    buys = 0
+    bought = 0
+    sold = 0
+    open_syms = {SYMBOL} if qty > 0 else set()
+    for index, order in enumerate(orders):
+        side = order["side"]
+        written = (
+            int(order["notional_quote_units"])
+            if side == "buy"
+            else int(order["qty"])
+        )
+        reject = None
+        amount = written
+        if index >= MAX_ORDERS:
+            reject = "max_orders_per_bar"
+        elif order["client_id"] in used_ids:
+            reject = "duplicate_client_id"
+        elif order["symbol"] != SYMBOL:
+            reject = "not_in_universe"
+        elif written == 0:
+            reject = "zero_amount"
+        elif is_last:
+            reject = "after_end"
+        elif close is None:
+            reject = "no_bar"
+        elif side == "buy":
+            cash_left = cash - buys
+            held_value = value(qty, close)
+            if amount == 0:
+                reject = "insufficient_cash" if cash_left <= 0 else "max_weight"
+            elif amount < MIN_NOTIONAL:
+                reject = "below_min_notional"
+            elif amount > cash_left:
+                reject = "insufficient_cash"
+            elif SYMBOL not in open_syms and len(open_syms) >= 1:
+                reject = "max_open_positions"
+            elif (held_value + bought + amount) * BPS > MAX_WEIGHT_BPS * equity:
+                reject = "max_weight"
+            if reject is None:
+                buys += amount
+                bought += amount
+                open_syms.add(SYMBOL)
+        else:
+            available = qty - sold
+            if amount == 0 or amount > available:
+                reject = "insufficient_position"
+            elif amount != available and value(amount, close) < MIN_NOTIONAL:
+                reject = "below_min_notional"
+            if reject is None:
+                sold += amount
+        used_ids.add(order["client_id"])
+        pending.append(
+            {
+                "order": order,
+                "seq": seq,
+                "index": index,
+                "reject": reject,
+                "amount": amount,
+                "close": close,
+            }
+        )
+    return pending
+
+
+def run_slots(slots, first_close_ms, bot_path=None):
+    """Replay slots through the bot subprocess; return metrics and replies."""
+    bot = str(bot_path or WORKDIR / "main.py")
+    env = dict(os.environ)
+    env["PYTHONHASHSEED"] = "0"
     proc = subprocess.Popen(
-        [sys.executable, "-P", "-s", bot_path],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        text=True, bufsize=1, cwd="/tmp")
+        [sys.executable, "-P", "-s", bot],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env=env,
+    )
+
     def send(obj):
         proc.stdin.write(json.dumps(obj, separators=(",", ":")) + "\n")
         proc.stdin.flush()
+
     def recv():
         line = proc.stdout.readline()
         if not line:
-            raise RuntimeError("bot closed stdout")
-        return json.loads(line)
+            err = proc.stderr.read()
+            raise RuntimeError(f"bot exited early: {err[:2000]}")
+        return line.rstrip("\n")
+
+    hello = {
+        "type": "hello",
+        "protocol": "agent-fun/bars-replay/v1",
+        "seed": "20261117",
+        "symbols": [
+            {
+                "symbol": SYMBOL,
+                "mint": MINT,
+                "price_scale": PRICE_SCALE,
+                "qty_scale": QTY_SCALE,
+            }
+        ],
+        "capital": {
+            "quote": "USDC",
+            "quote_scale": QUOTE_SCALE,
+            "quote_units": str(START_CASH),
+        },
+        "bar_interval": "1m",
+        "first_close_ms": first_close_ms,
+        "caps": {
+            "max_open_positions": 1,
+            "max_orders_per_bar": MAX_ORDERS,
+            "max_weight_bps": MAX_WEIGHT_BPS,
+            "shorts": False,
+            "leverage": False,
+        },
+        "fees": {
+            "fee_bps": FEE_BPS,
+            "slippage_bps": SLIP_BPS,
+            "min_notional_quote_units": str(MIN_NOTIONAL),
+        },
+        "latency_bars": 1,
+    }
     send(hello)
-    for seq, bar in enumerate(bars):
-        fills = []
-        if h._pending:
-            orders, decision_close = h._pending
-            fills = h.resolve_orders(orders, decision_close, bar)
-            h._pending = []
-        eq = h.equity_at(int(bar["c"]))
-        if eq > h.peak_equity:
-            h.peak_equity = eq
-        dd = (h.peak_equity - eq) / h.peak_equity
-        h.max_dd = max(h.max_dd, dd)
-        h.equity_curve.append(eq)
-        batch = {"type": "batch", "seq": seq, "t": int(bar["t"]),
-                 "bars": [{"symbol": SYMBOL, "t": int(bar["t"]),
-                           "o": str(bar["o"]), "h": str(bar["h"]),
-                           "l": str(bar["l"]), "c": str(bar["c"]),
-                           "v": None,
-                           "o_depth": [str(d) for d in bar["o_depth"]],
-                           "c_depth": [str(d) for d in bar["c_depth"]]}],
-                 "fills": fills,
-                 "account": h.account(eq)}
-        send(batch)
-        reply = recv()
-        assert reply.get("type") == "reply" and reply.get("seq") == seq, reply
-        orders = reply.get("orders", [])
-        if orders:
-            h._pending = (orders, int(bar["c"]))
-        for f in fills:
-            h.fills_log.append((seq, f))
-    h._pending = []
-    h.flatten()
-    h._note_equity(int(bars[-1]["c"]))
-    done = {"type": "done", "seq": len(bars), "reason": "end_of_data",
-            "account": h.account(h.cash)}
-    send(done)
-    proc.stdin.close()
-    proc.wait(timeout=30)
-    if proc.returncode != 0:
-        raise RuntimeError(f"bot exited {proc.returncode}")
-    return h
+
+    cash = START_CASH
+    qty = 0
+    cost = 0
+    last_close = None
+    last_close_depth = None
+    trades = 0
+    replies = []
+    used_ids = set()
+    equity_points = [START_CASH]
+    pending = []
+
+    def resolve_one(p, bar, pools):
+        nonlocal cash, qty, cost, trades
+        base = {
+            "client_id": p["order"]["client_id"],
+            "symbol": SYMBOL,
+            "side": p["order"]["side"],
+            "status": "rejected",
+            "reason": None,
+            "decided_bar": first_close_ms + p["seq"] * STEP_MS,
+            "fill_bar": first_close_ms + (p["seq"] + 1) * STEP_MS,
+            "price": "0",
+            "qty": "0",
+            "notional_quote_units": "0",
+            "fee_quote_units": "0",
+        }
+        if p["reject"] is not None:
+            base["reason"] = p["reject"]
+            return base
+        if bar is None:
+            base["reason"] = "no_bar"
+            return base
+        pool = pools.get(SYMBOL)
+        if pool is None:
+            pool = _pool_for(bar["o_depth"])
+            pools[SYMBOL] = pool
+        close = p["close"]
+        max_slip = int(p["order"]["max_slippage_bps"])
+        if p["order"]["side"] == "buy":
+            price, spend, fee, got, after = _buy_fill(
+                p["amount"], bar["o"], pool
+            )
+            if price * BPS > close * (BPS + max_slip):
+                base["reason"] = "max_slippage"
+                return base
+            if got == 0:
+                base["reason"] = "zero_amount"
+                return base
+            pools[SYMBOL] = after
+            cash -= p["amount"]
+            qty += got
+            cost += p["amount"]
+            trades += 1
+            base.update(
+                {
+                    "status": "filled",
+                    "price": str(price),
+                    "qty": str(got),
+                    "notional_quote_units": str(p["amount"]),
+                    "fee_quote_units": str(fee),
+                }
+            )
+            return base
+        price, gross, fee, proceeds, after = _sell_fill(
+            p["amount"], bar["o"], pool
+        )
+        if price * BPS < close * (BPS - max_slip):
+            base["reason"] = "max_slippage"
+            return base
+        if p["amount"] > qty:
+            raise RuntimeError("sell exceeds the position held")
+        pools[SYMBOL] = after
+        cash += proceeds
+        cost = cost * (qty - p["amount"]) // qty if qty else 0
+        qty -= p["amount"]
+        trades += 1
+        base.update(
+            {
+                "status": "filled",
+                "price": str(price),
+                "qty": str(p["amount"]),
+                "notional_quote_units": str(proceeds),
+                "fee_quote_units": str(fee),
+            }
+        )
+        return base
+
+    try:
+        for k, bar in enumerate(slots):
+            t = first_close_ms + k * STEP_MS
+            fills = []
+            if pending:
+                pools = {}
+                for p in pending:
+                    fills.append(resolve_one(p, bar, pools))
+                pending = []
+            if bar is not None:
+                last_close = bar["c"]
+                last_close_depth = bar["c_depth"]
+            equity = cash
+            if qty > 0 and last_close is not None:
+                equity += value(qty, last_close)
+            account = {
+                "cash_quote_units": str(cash),
+                "positions": (
+                    [
+                        {
+                            "symbol": SYMBOL,
+                            "qty": str(qty),
+                            "cost_quote_units": str(cost),
+                        }
+                    ]
+                    if qty > 0
+                    else []
+                ),
+                "equity_quote_units": str(equity),
+            }
+            batch = {
+                "type": "batch",
+                "seq": k,
+                "t": t,
+                "bars": [_wire_bar(bar)] if bar is not None else [],
+                "fills": fills,
+                "account": account,
+            }
+            send(batch)
+            line = recv()
+            replies.append(line)
+            reply = json.loads(line)
+            if reply.get("type") != "reply" or reply.get("seq") != k:
+                raise RuntimeError(f"bad reply at batch {k}: {line[:200]}")
+            pending = _decide(
+                reply["orders"],
+                k,
+                k == len(slots) - 1,
+                cash,
+                qty,
+                last_close,
+                equity,
+                used_ids,
+            )
+            equity_points.append(equity)
+        for p in pending:
+            if p["reject"] is None:
+                raise RuntimeError("last batch order passed its checks")
+        if qty > 0:
+            _, _, _, proceeds, _ = _sell_fill(
+                qty, last_close, _pool_for(last_close_depth)
+            )
+            cash += proceeds
+            qty = 0
+            cost = 0
+        equity_points.append(cash)
+    finally:
+        try:
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
+        proc.wait(timeout=60)
+
+    peak = equity_points[0]
+    worst = 0.0
+    for eq in equity_points:
+        if eq > peak:
+            peak = eq
+        dd = (peak - eq) / peak if peak else 0.0
+        if dd > worst:
+            worst = dd
+    net = cash - START_CASH
+    return {
+        "net_pnl_units": net,
+        "net_pnl_usd": net / 1_000_000,
+        "trades": trades,
+        "max_drawdown": worst,
+        "final_cash_units": cash,
+        "batches": len(slots),
+        "replies": replies,
+    }
+
+
+def run_dev(bot_path=None):
+    bars = dev_bars()
+    return run_slots(bars, bars[0]["t"], bot_path)
+
+
+WINDOW_FILES = {
+    "race": "btc-race-window.json",
+    "nextdev": "btc-nextdev.json",
+    "w3": "btc-w3-1116-partial.json",
+    "w4": "btc-w4-1113.json",
+    "w5": "btc-w5-1112.json",
+    "w6": "btc-w6-1111.json",
+}
+
+
+def run_window(name, bot_path=None):
+    slots, first = race_slots(WINDOW_FILES[name])
+    return run_slots(slots, first, bot_path)
+
+
+def run_race(bot_path=None):
+    return run_window("race", bot_path)
+
+
+def run_with_overrides(slots, first_close_ms, overrides):
+    """Replay with a throwaway copy of the bot whose constants are patched.
+
+    Used by the grid sweeps: the entry's own main.py is never touched, the
+    patched copy lives in a temp dir and is deleted afterwards.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="btc-grid-"))
+    try:
+        shutil.copytree(WORKDIR / "vendor", tmp / "vendor")
+        text = (WORKDIR / "main.py").read_text()
+        for name, val in overrides.items():
+            text, n = re.subn(
+                rf"^{name} = .*$", f"{name} = {val!r}", text, count=1, flags=re.M
+            )
+            if n != 1:
+                raise ValueError(f"constant {name} not found in main.py")
+        (tmp / "main.py").write_text(text)
+        return run_slots(slots, first_close_ms, tmp / "main.py")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def describe(name, res):
+    return (
+        f"{name}: net ${res['net_pnl_usd']:+.2f} | "
+        f"trades {res['trades']} | max DD {res['max_drawdown'] * 100:.2f}%"
+    )
 
 
 if __name__ == "__main__":
-    import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--bot", required=True)
-    ap.add_argument("--bars", required=True, choices=["dev", "race"])
-    ap.add_argument("--mode", default="subprocess", choices=["subprocess", "inprocess"])
-    args = ap.parse_args()
-    if args.bars == "dev":
-        bars = load_dev_bars()
+    which = sys.argv[1] if len(sys.argv) > 1 else "dev"
+    if which == "dev":
+        print(describe("dev", run_dev()))
+    elif which in WINDOW_FILES:
+        print(describe(which, run_window(which)))
     else:
-        bars = load_coinbase(RACE_WINDOW_JSON, RACE_WINDOW_START)
-    if args.mode == "subprocess":
-        h = run_subprocess(args.bot, bars)
-    else:
-        import importlib.util
-        specmod = importlib.util.spec_from_file_location("botmod", args.bot)
-        mod = importlib.util.module_from_spec(specmod)
-        specmod.loader.exec_module(mod)
-        shim = "/".join(args.bot.split("/")[:-1]) + "/vendor"
-        h = run_inprocess(mod.DipBot().on_batch, bars, shim)
-    print(json.dumps({**h.summary(), "bars": args.bars, "mode": args.mode}, indent=1))
+        raise SystemExit(
+            f"unknown window {which!r} (dev | race | nextdev | w3 | w4 | w5 | w6)"
+        )
