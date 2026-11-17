@@ -8,22 +8,26 @@ only +$4.20 instead of the dip's +2.1%. Fix: arm the fallback late
 remains only as the >=1-trade guarantee.
 Dims: UPTICK x DIP60 x DIP120 x TRAIL x REENTRY x FALLBACK.
 Fixed: STOP 200, MAX_HOLD 1440, COOLDOWN 60, HARD = FALLBACK + 60.
+
+Dev tool only — the grader never runs this. Window data lives under
+data/ in this workdir (local copies, never part of the entry).
 """
 import itertools
 import json
 import statistics
 import sys
 
-sys.path.insert(0, "/home/hatch/workspace/makefun/work/btc-race-24h-v2")
+WORKDIR = "/home/hatch/workspace/makefun/work/btc-race-24h-v2"
+sys.path.insert(0, WORKDIR)
 import replay
 
 WINDOWS = {}
 WINDOWS["dev"] = replay.load_dev_bars()
-WINDOWS["race"] = replay.load_coinbase("/tmp/btc-race-window.json", 1794753780)
-WINDOWS["w4"] = replay.load_coinbase("/tmp/btc-w4-1113.json", 1794476880)
-WINDOWS["w5"] = replay.load_coinbase("/tmp/btc-w5-1112.json", 1794390480)
-WINDOWS["w6"] = replay.load_coinbase("/tmp/btc-w6-1111.json", 1794304080)
-_raw = json.load(open("/tmp/btc-nextdev.json"))
+WINDOWS["race"] = replay.load_coinbase(WORKDIR + "/data/btc-race-window.json", 1794753780)
+WINDOWS["w4"] = replay.load_coinbase(WORKDIR + "/data/btc-w4-1113.json", 1794476880)
+WINDOWS["w5"] = replay.load_coinbase(WORKDIR + "/data/btc-w5-1112.json", 1794390480)
+WINDOWS["w6"] = replay.load_coinbase(WORKDIR + "/data/btc-w6-1111.json", 1794304080)
+_raw = json.load(open(WORKDIR + "/data/btc-nextdev.json"))
 _nd = []
 for c in _raw:
     t_open = int(c[0])
@@ -39,10 +43,10 @@ WINDOWS["nextdev"] = _nd
 
 import importlib.util
 _spec = importlib.util.spec_from_file_location(
-    "botv2", "/home/hatch/workspace/makefun/work/btc-race-24h-v2/main.py")
+    "botv2", WORKDIR + "/main.py")
 bot = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(bot)
-SHIM = "/home/hatch/workspace/makefun/work/btc-race-24h-v2/vendor"
+SHIM = WORKDIR + "/vendor"
 
 
 def run_all():
@@ -87,7 +91,7 @@ def main():
             "windows": r,
         })
     results.sort(key=lambda x: (x["hard_fail"], -x["worst"], -x["race_pnl"]))
-    json.dump(results, open("/home/hatch/workspace/makefun/work/btc-race-24h-v2/grid4-results.json", "w"), indent=1)
+    json.dump(results, open(WORKDIR + "/grid4-results.json", "w"), indent=1)
     print("=== TOP 12 by worst-window PnL ===")
     for r in results[:12]:
         print(json.dumps(r))

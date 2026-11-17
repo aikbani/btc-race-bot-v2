@@ -45,16 +45,24 @@ SYMBOL = "CBBTC"
 MINT = "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij"
 DEV_DEPTH_MEDIAN = 642377006705  # median o_depth of the kit dev bars (quote units)
 
+# Paths for this race (btc-race-24h-20261117-0603). The dev bars come
+# straight from the new competition kit; the race window is the local
+# sanity copy kept under data/ (dev tool only — never part of the entry).
+WORKDIR = "/home/hatch/workspace/makefun/work/btc-race-24h-v2"
+NEW_KIT_DEV_BARS = ("/home/hatch/workspace/makefun/work/btc-race-24h-v2-kit/"
+                    "btc-race-24h-20261117-0603-kit/dataset/bars/CBBTC.ndjson.gz")
+RACE_WINDOW_JSON = WORKDIR + "/data/btc-race-window.json"
+RACE_WINDOW_START = 1794753780  # 2026-11-15 08:28 UTC
+
 
 def value(qty, price):
     return qty * price * 10 ** QUOTE_SCALE // 10 ** (QTY_SCALE + PRICE_SCALE)
 
 
 def load_dev_bars():
-    path = ("/home/hatch/workspace/makefun/btc-race-24h-kit/"
-            "btc-race-24h-20261115-0828-kit/dataset/bars/CBBTC.ndjson.gz")
+    """The new kit's dev bars: 16 Nov 13:04 -> 17 Nov 13:03 WIB, 1440 bars."""
     bars = []
-    with gzip.open(path, "rt") as f:
+    with gzip.open(NEW_KIT_DEV_BARS, "rt") as f:
         for line in f:
             b = json.loads(line)
             bars.append({
@@ -391,32 +399,13 @@ if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--bot", required=True)
-    ap.add_argument("--bars", required=True, choices=["dev", "race", "w3", "w4", "w5", "w6"])
+    ap.add_argument("--bars", required=True, choices=["dev", "race"])
     ap.add_argument("--mode", default="subprocess", choices=["subprocess", "inprocess"])
     args = ap.parse_args()
     if args.bars == "dev":
         bars = load_dev_bars()
     else:
-        spec = {"race": ("/tmp/btc-race-window.json", 1794753780),
-                "w3": ("/tmp/btc-w3-1116-partial.json", 1794840180),
-                "w4": ("/tmp/btc-w4-1113.json", 1794476880),
-                "w5": ("/tmp/btc-w5-1112.json", 1794390480),
-                "w6": ("/tmp/btc-w6-1111.json", 1794304080)}[args.bars]
-        if args.bars == "w3":
-            raw = json.load(open(spec[0]))
-            bars = []
-            for c in raw:
-                t_open = int(c[0])
-                o = int(round(float(c[3]) * 10 ** PRICE_SCALE))
-                h_ = int(round(float(c[2]) * 10 ** PRICE_SCALE))
-                l = int(round(float(c[1]) * 10 ** PRICE_SCALE))
-                cl = int(round(float(c[4]) * 10 ** PRICE_SCALE))
-                bars.append({"t": (t_open + 60) * 1000, "o": o, "h": h_, "l": l, "c": cl,
-                             "o_depth": [DEV_DEPTH_MEDIAN], "c_depth": [DEV_DEPTH_MEDIAN]})
-            bars.sort(key=lambda b: b["t"])
-            bars = bars[:1440]
-        else:
-            bars = load_coinbase(spec[0], spec[1])
+        bars = load_coinbase(RACE_WINDOW_JSON, RACE_WINDOW_START)
     if args.mode == "subprocess":
         h = run_subprocess(args.bot, bars)
     else:

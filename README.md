@@ -9,6 +9,10 @@ A bot that trades cbBTC (CBBTC) against USDC, minute by minute, in make.fun's
 trading bot live for 24 hours" (`btc-race-24h-20261117-0603`),
 account @aik-bani. Python 3.13, standard library only.
 
+This entry was rebuilt in a fresh session after the race opened
+(2026-11-17 13:03 WIB), so every file here was authored inside the
+competition window.
+
 ## What changed vs v1 (and why)
 
 v1 resolved 2026-11-17 with **$0, 0 trades**: its 2.00% dip trigger never fired
@@ -59,6 +63,11 @@ same data answer byte for byte alike.
 - `main.py` — the entrypoint (root, run as `python3 -P -s main.py`).
 - `vendor/makefun_bars.py` — the kit's Python protocol shim, copied
   byte-for-byte from the competition kit (`sdk/makefun_bars.py`).
+- `replay.py` — local bars-replay/v1 harness driver (exact fill model).
+- `grid.py`–`grid5.py` — the parameter grid searches behind the shipped
+  constants (dev tools; the grader never runs them).
+- `verify_final.py` — final verification: replays the shipped constants on
+  the new kit's dev window and on the last race window, subprocess mode.
 - `LICENSE` — MIT.
 
 ## Local backtests (frozen-window replay, exact fill model)

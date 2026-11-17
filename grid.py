@@ -13,24 +13,28 @@ Selection: hard fail if dev PnL <= 0, any full window has 0 trades, or
 any max DD > 25%. Among survivors rank by worst PnL across the six
 windows (maximin), then by median PnL. The point is robustness on an
 UNSEEN window, not the best number on any single one.
+
+Dev tool only — the grader never runs this. Window data lives under
+data/ in this workdir (local copies, never part of the entry).
 """
 import itertools
 import json
 import statistics
 import sys
 
-sys.path.insert(0, "/home/hatch/workspace/makefun/work/btc-race-24h-v2")
+WORKDIR = "/home/hatch/workspace/makefun/work/btc-race-24h-v2"
+sys.path.insert(0, WORKDIR)
 import replay
 
 # --- load windows once ------------------------------------------------------
 WINDOWS = {}
 WINDOWS["dev"] = replay.load_dev_bars()
-WINDOWS["race"] = replay.load_coinbase("/tmp/btc-race-window.json", 1794753780)
-WINDOWS["w4"] = replay.load_coinbase("/tmp/btc-w4-1113.json", 1794476880)
-WINDOWS["w5"] = replay.load_coinbase("/tmp/btc-w5-1112.json", 1794390480)
-WINDOWS["w6"] = replay.load_coinbase("/tmp/btc-w6-1111.json", 1794304080)
+WINDOWS["race"] = replay.load_coinbase(WORKDIR + "/data/btc-race-window.json", 1794753780)
+WINDOWS["w4"] = replay.load_coinbase(WORKDIR + "/data/btc-w4-1113.json", 1794476880)
+WINDOWS["w5"] = replay.load_coinbase(WORKDIR + "/data/btc-w5-1112.json", 1794390480)
+WINDOWS["w6"] = replay.load_coinbase(WORKDIR + "/data/btc-w6-1111.json", 1794304080)
 # w3 partial: 896 bars
-_raw = json.load(open("/tmp/btc-w3-1116-partial.json"))
+_raw = json.load(open(WORKDIR + "/data/btc-w3-1116-partial.json"))
 _w3 = []
 for c in _raw:
     t_open = int(c[0])
@@ -47,10 +51,10 @@ WINDOWS["w3"] = _w3
 # --- import the bot module (constants patched per combo) --------------------
 import importlib.util
 _spec = importlib.util.spec_from_file_location(
-    "botv2", "/home/hatch/workspace/makefun/work/btc-race-24h-v2/main.py")
+    "botv2", WORKDIR + "/main.py")
 bot = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(bot)
-SHIM = "/home/hatch/workspace/makefun/work/btc-race-24h-v2/vendor"
+SHIM = WORKDIR + "/vendor"
 
 
 def run_all():
@@ -97,7 +101,7 @@ def main():
             "windows": r,
         })
     results.sort(key=lambda x: (x["hard_fail"], -x["worst"], -x["median"]))
-    json.dump(results, open("/home/hatch/workspace/makefun/work/btc-race-24h-v2/grid-results.json", "w"), indent=1)
+    json.dump(results, open(WORKDIR + "/grid-results.json", "w"), indent=1)
     print("=== TOP 12 (survivors first, by worst-window PnL) ===")
     for r in results[:12]:
         print(json.dumps(r))

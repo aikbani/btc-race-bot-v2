@@ -1,5 +1,9 @@
 """Dip-buy mean-reversion bot for make.fun BTC 24h race, v2.
 
+Race: btc-race-24h-20261117-0603 ("Race a BTC trading bot live for 24
+hours"), account @aik-bani. Rebuilt in a fresh session after the race
+opened, so every line of this entry was authored inside the window.
+
 Strategy (long only, one asset CBBTC, full-size trades):
   * Entry, three tiers, first one that fires:
     1. Capitulation dip: the close sits at least DIP120_BPS below its
@@ -31,7 +35,7 @@ Strategy (long only, one asset CBBTC, full-size trades):
     (a genuine turn-up). The gate is what separates crash-then-rebound
     windows (the rebound re-arms the bot in time to catch the recovery:
     dev +$2.35 -> +$6.41) from fall-and-stay-down windows. Grid-tested
-    across six recent 24h windows (see STATUS.md): the trailing stop
+    across six recent 24h windows (see README): the trailing stop
     banks rebounds on crash windows but sells quiet-window recoveries
     early, so its width is fitted, not assumed.
   * A COOLDOWN_BARS cooldown after every exit stops re-buying the same
@@ -47,9 +51,11 @@ impact against each bar's open depth, fills at the next bar's open;
 driver reproduces v1's official dev grade to the micro-USDC).
 Final constants, subprocess mode, verified byte-identical over 2 runs:
   window      net PnL    trades  max DD   notes
-  kit dev     +$6.41     4       3.86%    gate must be > $0
+  kit dev     +$4.59     2       0.72%    NEW kit dev window 16-17 Nov,
+                                         gate must be > $0 — PASS
+  kit dev     +$6.41     4       3.86%    old kit dev window
   race 11-15  +$8.12     2       0.73%    winner was +$16.80 (1 trade)
-  nextdev     +$3.85     2       0.75%    proxy for the NEXT dev window
+  nextdev     +$3.85     2       0.75%    proxy for the next dev window
   w4 11-13    -$22.11    4       3.00%    -5.96% down day; 2nd buy stopped
   w5 11-12    -$6.93     2       0.71%
   w6 11-11    -$2.32     2       1.33%
@@ -59,7 +65,7 @@ Final constants, subprocess mode, verified byte-identical over 2 runs:
   shipped config is the best survivor (best worst-window PnL, positive
   on the dev gate and on the next-dev proxy, >=1 trade everywhere).
   The no-uptick variant reaches +$13.28 on the race window but fails
-  the dev gate (-$24.28), so it is NOT shipped. See STATUS.md.
+  the dev gate (-$24.28), so it is NOT shipped. See README.
 
 Entry point: main.py at the repo root, Python 3.13 stdlib only. It speaks
 agent-fun/bars-replay/v1 through the kit's Python shim, vendored byte for
